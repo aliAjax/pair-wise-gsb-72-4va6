@@ -25,7 +25,8 @@ import SaveOutlinedIcon from '@mui/icons-material/SaveOutlined'
 import SendOutlinedIcon from '@mui/icons-material/SendOutlined'
 import ArrowBackIcon from '@mui/icons-material/ArrowBack'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { useGetAuditQuery, useGetFlagQuery, useGetFlagsQuery, useSaveFlagMutation, useSubmitForReviewMutation } from '@/services/flagApi'
+import { useGetAuditQuery, useGetFlagQuery, useGetFlagsQuery, useGetSnapshotsQuery, useSaveFlagMutation, useSubmitForReviewMutation } from '@/services/flagApi'
+import { environmentLabel, flagDriftedFromSnapshot } from '@/services/database'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
 import { DependencyGraph } from '@/components/DependencyGraph'
 import type { AudienceRule, Dependency, FeatureFlag, RuleOperator, RolloutStep } from '@/types'
@@ -72,14 +73,18 @@ export function FlagEditorPage() {
   const [tab, setTab] = useState(0)
   const [draft, setDraft] = useState<FeatureFlag>(emptyFlag)
   const [errors, setErrors] = useState<string[]>([])
+  const [notice, setNotice] = useState('')
   const [savedFlag, setSavedFlag] = useState<FeatureFlag | null>(null)
   const [metricInput, setMetricInput] = useState('')
   const { data: existing, isLoading } = useGetFlagQuery(id ?? '', { skip: isNew })
   const { data: allFlags = [] } = useGetFlagsQuery({})
   const { data: audit = [] } = useGetAuditQuery({ flagId: id ?? '' }, { skip: isNew })
+  const { data: snapshots = [] } = useGetSnapshotsQuery(id ?? '', { skip: isNew })
   const [saveFlag, saveState] = useSaveFlagMutation()
   const [submitReview, submitState] = useSubmitForReviewMutation()
   const activeFlag = savedFlag ?? draft
+  const activeSnapshot = snapshots.find((snapshot) => snapshot.status === 'active') ?? snapshots[0]
+  const draftDrifted = activeSnapshot ? flagDriftedFromSnapshot(activeSnapshot, draft) : false
 
   useEffect(() => {
     if (existing) setDraft(existing)
@@ -117,10 +122,17 @@ export function FlagEditorPage() {
     if (!validate()) return null
     try {
       const result = await saveFlag({ ...draft, updatedAt: new Date().toISOString() }).unwrap()
-      setSavedFlag(result)
-      setDraft(result)
-      if (isNew) navigate(`/flags/${result.id}`, { replace: true })
-      return result
+      setSavedFlag(result.flag)
+      setDraft(result.flag)
+      if (result.invalidatedEnvironments.length > 0) {
+        setNotice(
+          `已保存；${result.invalidatedEnvironments.map((env) => environmentLabel[env]).join('、')}环境的发布计划已失效，需重新评审，已推进环境继续按原快照运行`,
+        )
+      } else {
+        setNotice('')
+      }
+      if (isNew) navigate(`/flags/${result.flag.id}`, { replace: true })
+      return result.flag
     } catch {
       setErrors(['保存失败，请检查本地存储权限后重试'])
       return null
@@ -233,12 +245,26 @@ export function FlagEditorPage() {
         </Alert>
       )}
 
+      {notice && (
+        <Alert severity="warning" onClose={() => setNotice('')} sx={{ mb: 2 }}>
+          {notice}
+        </Alert>
+      )}
+
+      {draftDrifted && activeSnapshot && (
+        <Alert severity="info" sx={{ mb: 2 }}>
+          当前编辑内容与生效快照 v{activeSnapshot.version} 不一致：保存后未推进环境的发布计划将失效并需重新评审，
+          已推进环境继续按快照 v{activeSnapshot.version} 运行。
+        </Alert>
+      )}
+
       <Card>
         <Tabs value={tab} onChange={(_event, value: number) => setTab(value)} className="editor-tabs">
           <Tab label="基础信息" />
           <Tab label="受众规则" />
           <Tab label="依赖与兼容" />
           <Tab label="灰度与回滚" />
+          <Tab label="发布快照" />
           <Tab label="审计记录" />
         </Tabs>
 
@@ -521,6 +547,52 @@ export function FlagEditorPage() {
         )}
 
         {tab === 4 && (
+          <CardContent className="editor-panel">
+            <Box className="section-heading">
+              <Box>
+                <Typography variant="h3">发布快照历史</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  每次批准生成一份不可变快照，封存受众规则、依赖条件与回滚阈值，内容不可再修改。
+                </Typography>
+              </Box>
+            </Box>
+            <Box className="snapshot-list">
+              {snapshots.map((snapshot) => (
+                <Box key={snapshot.id} className={`snapshot-item ${snapshot.status === 'active' ? 'active' : ''}`}>
+                  <Stack direction="row" justifyContent="space-between" alignItems="center">
+                    <Stack direction="row" spacing={1} alignItems="center">
+                      <Typography fontWeight={700}>快照 v{snapshot.version}</Typography>
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        color={snapshot.status === 'active' ? 'primary' : 'default'}
+                        label={snapshot.status === 'active' ? '当前生效' : snapshot.status === 'superseded' ? '已被取代' : '已失效'}
+                      />
+                    </Stack>
+                    <Typography variant="caption" color="text.secondary">
+                      {snapshot.approvedBy} · {snapshot.approvedAt.slice(0, 16).replace('T', ' ')} · 校验 {snapshot.checksum}
+                    </Typography>
+                  </Stack>
+                  <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                    {snapshot.comment || '无评审意见'}
+                  </Typography>
+                  <Stack direction="row" spacing={0.7} sx={{ mt: 1 }} flexWrap="wrap" useFlexGap>
+                    <Chip size="small" variant="outlined" label={`受众规则 ${snapshot.audienceRules.length} 条`} />
+                    <Chip size="small" variant="outlined" label={`依赖条件 ${snapshot.dependencies.length} 项`} />
+                    <Chip size="small" variant="outlined" label={`回滚阈值 ${snapshot.rollbackConditions.length} 条`} />
+                    <Chip size="small" variant="outlined" label={`监控指标 ${snapshot.metricNames.length} 个`} />
+                    <Chip size="small" variant="outlined" label={`灰度阶段 ${snapshot.rolloutSteps.length} 步`} />
+                  </Stack>
+                </Box>
+              ))}
+              {snapshots.length === 0 && (
+                <Typography className="empty-state">尚未生成发布快照，通过影响评审批准后自动创建。</Typography>
+              )}
+            </Box>
+          </CardContent>
+        )}
+
+        {tab === 5 && (
           <CardContent className="editor-panel">
             <Typography variant="h3" sx={{ mb: 2 }}>配置审计记录</Typography>
             <Box className="audit-timeline">

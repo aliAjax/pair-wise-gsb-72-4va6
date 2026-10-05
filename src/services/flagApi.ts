@@ -1,27 +1,37 @@
 import { createApi, fakeBaseQuery } from '@reduxjs/toolkit/query/react'
 import {
+  advanceEnvironment,
   applyReview,
+  freezeRollout,
   getDashboardStats,
   readDatabase,
+  resolveIssue,
   rollbackFlag,
-  writeDatabase,
+  saveFlagConfig,
+  submitFlagForReview,
 } from '@/services/database'
 import type {
   AuditEvent,
   DashboardData,
+  Environment,
   FeatureFlag,
   FlagFilter,
   ImpactIssue,
+  ReleasePlan,
+  ReleaseSnapshot,
   ReviewPayload,
 } from '@/types'
 
 const delay = (milliseconds = 180) =>
   new Promise((resolve) => window.setTimeout(resolve, milliseconds))
 
+const toErrorMessage = (error: unknown, fallback: string) =>
+  error instanceof Error ? error.message : fallback
+
 export const flagApi = createApi({
   reducerPath: 'flagApi',
   baseQuery: fakeBaseQuery<{ message: string }>(),
-  tagTypes: ['Flags', 'Flag', 'Issues', 'Audit', 'Dashboard'],
+  tagTypes: ['Flags', 'Flag', 'Issues', 'Audit', 'Dashboard', 'Plans', 'Snapshots'],
   endpoints: (builder) => ({
     getDashboard: builder.query<DashboardData, void>({
       async queryFn() {
@@ -57,108 +67,151 @@ export const flagApi = createApi({
       },
       providesTags: (_result, _error, id) => [{ type: 'Flag', id }],
     }),
-    saveFlag: builder.mutation<FeatureFlag, FeatureFlag>({
+    getSnapshots: builder.query<ReleaseSnapshot[], string | void>({
+      async queryFn(flagId) {
+        await delay()
+        const data = readDatabase()
+          .snapshots.filter((snapshot) => !flagId || snapshot.flagId === flagId)
+          .sort((left, right) => right.version - left.version)
+        return { data }
+      },
+      providesTags: ['Snapshots'],
+    }),
+    getReleasePlans: builder.query<ReleasePlan[], void>({
+      async queryFn() {
+        await delay()
+        return { data: readDatabase().plans }
+      },
+      providesTags: ['Plans'],
+    }),
+    getReleasePlan: builder.query<ReleasePlan | null, string>({
+      async queryFn(flagId) {
+        await delay()
+        const plan = readDatabase().plans.find((item) => item.flagId === flagId)
+        return { data: plan ?? null }
+      },
+      providesTags: (_result, _error, flagId) => [{ type: 'Plans', id: flagId }],
+    }),
+    saveFlag: builder.mutation<
+      { flag: FeatureFlag; invalidatedEnvironments: Environment[] },
+      FeatureFlag
+    >({
       async queryFn(flag) {
         await delay(260)
-        const db = readDatabase()
-        const index = db.flags.findIndex((item) => item.id === flag.id)
-        const next = { ...flag, updatedAt: new Date().toISOString() }
-        if (index >= 0) {
-          const before = db.flags[index]
-          db.flags[index] = next
-          db.audit.unshift({
-            id: `audit-${Date.now()}`,
-            flagId: flag.id,
-            flagKey: flag.key,
-            action: 'updated',
-            actor: flag.lastChangedBy,
-            summary: '更新开关受众、依赖、版本或回滚条件。',
-            before: before.status,
-            after: next.status,
-            affectedUsers: Math.round(900000 * (next.rolloutPercentage / 100)),
-            createdAt: new Date().toISOString(),
-          })
-        } else {
-          db.flags.unshift(next)
-          db.audit.unshift({
-            id: `audit-${Date.now()}`,
-            flagId: next.id,
-            flagKey: next.key,
-            action: 'created',
-            actor: next.lastChangedBy,
-            summary: '创建功能开关草稿。',
-            after: next.status,
-            affectedUsers: 0,
-            createdAt: new Date().toISOString(),
-          })
+        try {
+          return { data: saveFlagConfig(flag) }
+        } catch (error) {
+          return { error: { message: toErrorMessage(error, '保存失败') } }
         }
-        writeDatabase(db)
-        return { data: next }
       },
-      invalidatesTags: ['Flags', 'Dashboard', 'Audit'],
+      invalidatesTags: ['Flags', 'Dashboard', 'Audit', 'Plans', 'Snapshots'],
     }),
     submitForReview: builder.mutation<FeatureFlag, { id: string; actor: string }>({
       async queryFn({ id, actor }) {
         await delay(220)
-        const db = readDatabase()
-        const flag = db.flags.find((item) => item.id === id)
-        if (!flag) return { error: { message: '功能开关不存在' } }
-        flag.status = 'review'
-        flag.updatedAt = new Date().toISOString()
-        flag.lastChangedBy = actor
-        db.audit.unshift({
-          id: `audit-${Date.now()}`,
-          flagId: id,
-          flagKey: flag.key,
-          action: 'submitted',
-          actor,
-          summary: '提交发布影响评审。',
-          before: 'draft',
-          after: 'review',
-          affectedUsers: Math.round(900000 * (flag.rolloutPercentage / 100)),
-          createdAt: new Date().toISOString(),
-        })
-        writeDatabase(db)
-        return { data: flag }
+        try {
+          return { data: submitFlagForReview(id, actor) }
+        } catch (error) {
+          return { error: { message: toErrorMessage(error, '提交评审失败') } }
+        }
       },
       invalidatesTags: (_result, _error, arg) => [
         'Flags',
         'Dashboard',
         'Audit',
+        'Plans',
         { type: 'Flag', id: arg.id },
       ],
     }),
-    reviewFlag: builder.mutation<FeatureFlag, { id: string; payload: ReviewPayload }>({
+    reviewFlag: builder.mutation<
+      { flag: FeatureFlag; snapshot: ReleaseSnapshot | null },
+      { id: string; payload: ReviewPayload }
+    >({
       async queryFn({ id, payload }) {
         await delay(260)
         try {
           return { data: applyReview(id, payload) }
         } catch (error) {
-          return { error: { message: error instanceof Error ? error.message : '审批失败' } }
+          return { error: { message: toErrorMessage(error, '审批失败') } }
         }
       },
       invalidatesTags: (_result, _error, arg) => [
         'Flags',
         'Dashboard',
         'Audit',
+        'Plans',
+        'Snapshots',
         { type: 'Flag', id: arg.id },
       ],
     }),
-    rollbackFlag: builder.mutation<FeatureFlag, { id: string; actor: string; reason: string }>({
+    advanceEnvironment: builder.mutation<
+      ReleasePlan,
+      { flagId: string; environment: Environment; actor: string }
+    >({
+      async queryFn({ flagId, environment, actor }) {
+        await delay(260)
+        try {
+          return { data: advanceEnvironment(flagId, environment, actor) }
+        } catch (error) {
+          return { error: { message: toErrorMessage(error, '推进失败') } }
+        }
+      },
+      invalidatesTags: (_result, _error, arg) => [
+        'Flags',
+        'Dashboard',
+        'Audit',
+        'Plans',
+        { type: 'Flag', id: arg.flagId },
+      ],
+    }),
+    freezeRollout: builder.mutation<FeatureFlag, { id: string; actor: string }>({
+      async queryFn({ id, actor }) {
+        await delay(220)
+        try {
+          return { data: freezeRollout(id, actor) }
+        } catch (error) {
+          return { error: { message: toErrorMessage(error, '冻结失败') } }
+        }
+      },
+      invalidatesTags: (_result, _error, arg) => [
+        'Flags',
+        'Dashboard',
+        'Audit',
+        'Plans',
+        { type: 'Flag', id: arg.id },
+      ],
+    }),
+    rollbackFlag: builder.mutation<
+      { flag: FeatureFlag; impactedPlans: string[] },
+      { id: string; actor: string; reason: string }
+    >({
       async queryFn({ id, actor, reason }) {
         await delay(260)
         try {
           return { data: rollbackFlag(id, actor, reason) }
         } catch (error) {
-          return { error: { message: error instanceof Error ? error.message : '回滚失败' } }
+          return { error: { message: toErrorMessage(error, '回滚失败') } }
         }
       },
       invalidatesTags: (_result, _error, arg) => [
         'Flags',
         'Dashboard',
         'Audit',
+        'Plans',
+        'Snapshots',
         { type: 'Flag', id: arg.id },
       ],
+    }),
+    resolveIssue: builder.mutation<ImpactIssue, { id: string; actor: string }>({
+      async queryFn({ id, actor }) {
+        await delay(200)
+        try {
+          return { data: resolveIssue(id, actor) }
+        } catch (error) {
+          return { error: { message: toErrorMessage(error, '操作失败') } }
+        }
+      },
+      invalidatesTags: ['Issues', 'Audit', 'Dashboard'],
     }),
     getIssues: builder.query<ImpactIssue[], { category?: string; resolved?: boolean }>({
       async queryFn(filters) {
@@ -191,10 +244,16 @@ export const {
   useGetDashboardQuery,
   useGetFlagsQuery,
   useGetFlagQuery,
+  useGetSnapshotsQuery,
+  useGetReleasePlansQuery,
+  useGetReleasePlanQuery,
   useSaveFlagMutation,
   useSubmitForReviewMutation,
   useReviewFlagMutation,
+  useAdvanceEnvironmentMutation,
+  useFreezeRolloutMutation,
   useRollbackFlagMutation,
+  useResolveIssueMutation,
   useGetIssuesQuery,
   useGetAuditQuery,
 } = flagApi

@@ -20,10 +20,41 @@ import {
 } from '@mui/material'
 import DownloadOutlinedIcon from '@mui/icons-material/DownloadOutlined'
 import AssessmentOutlinedIcon from '@mui/icons-material/AssessmentOutlined'
-import { useGetAuditQuery, useGetDashboardQuery, useGetFlagsQuery, useGetIssuesQuery } from '@/services/flagApi'
+import LinkOffOutlinedIcon from '@mui/icons-material/LinkOffOutlined'
+import { useGetDashboardQuery, useGetFlagsQuery, useGetIssuesQuery, useGetReleasePlansQuery, useGetSnapshotsQuery } from '@/services/flagApi'
+import { environmentLabel } from '@/services/database'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
+import type { Environment, EnvironmentPlan, ReleasePlan, ReleaseSnapshot } from '@/types'
 
 const escapeCsv = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`
+
+const envStatusLabel: Record<EnvironmentPlan['status'], string> = {
+  pending: '待推进',
+  'in-progress': '进行中',
+  completed: '已完成',
+  paused: '已暂停',
+  invalidated: '已失效',
+  halted: '已停止',
+}
+
+const currentPercentage = (env: EnvironmentPlan): number => {
+  const active = [...env.stages]
+    .reverse()
+    .find((stage) => stage.status === 'running' || stage.status === 'completed')
+  return active?.percentage ?? 0
+}
+
+interface ReportRow {
+  flagId: string
+  flagKey: string
+  flagName: string
+  owner: string
+  team: string
+  environment: Environment
+  envPlan: EnvironmentPlan | null
+  plan: ReleasePlan | null
+  snapshot: ReleaseSnapshot | null
+}
 
 export function ReportsPage() {
   const [environment, setEnvironment] = useState('')
@@ -31,29 +62,70 @@ export function ReportsPage() {
   const { data: flags = [], isLoading } = useGetFlagsQuery({})
   const { data: dashboard } = useGetDashboardQuery()
   const { data: issues = [] } = useGetIssuesQuery({})
-  const { data: audit = [] } = useGetAuditQuery({})
+  const { data: plans = [] } = useGetReleasePlansQuery()
+  const { data: snapshots = [] } = useGetSnapshotsQuery()
 
-  const reportFlags = useMemo(
-    () => flags.filter((flag) => !environment || flag.environment === environment),
-    [environment, flags],
-  )
+  const reportRows = useMemo<ReportRow[]>(() => {
+    const rows: ReportRow[] = []
+    flags.forEach((flag) => {
+      const plan = plans.find((item) => item.flagId === flag.id) ?? null
+      const environments = plan?.environments ?? []
+      if (environments.length === 0) {
+        if (!environment || flag.environment === environment) {
+          rows.push({
+            flagId: flag.id,
+            flagKey: flag.key,
+            flagName: flag.name,
+            owner: flag.owner,
+            team: flag.team,
+            environment: flag.environment,
+            envPlan: null,
+            plan: null,
+            snapshot: null,
+          })
+        }
+        return
+      }
+      environments.forEach((env) => {
+        if (environment && env.environment !== environment) return
+        rows.push({
+          flagId: flag.id,
+          flagKey: flag.key,
+          flagName: flag.name,
+          owner: flag.owner,
+          team: flag.team,
+          environment: env.environment,
+          envPlan: env,
+          plan,
+          snapshot: snapshots.find((snapshot) => snapshot.id === env.snapshotId) ?? null,
+        })
+      })
+    })
+    return rows
+  }, [environment, flags, plans, snapshots])
 
   const exportReport = () => {
     const rows = [
-      ['开关Key', '名称', '环境', '状态', '灰度比例', '负责人', '团队', '受众规则', '依赖数', '监控指标', '回滚条件', '预计影响用户'],
-      ...reportFlags.map((flag) => [
-        flag.key,
-        flag.name,
-        flag.environment,
-        flag.status,
-        `${flag.rolloutPercentage}%`,
-        flag.owner,
-        flag.team,
-        flag.audienceRules.length,
-        flag.dependencies.length,
-        flag.metricNames.join('|'),
-        flag.rollbackConditions.join('|'),
-        Math.round(980000 * (flag.rolloutPercentage / 100)),
+      ['开关Key', '名称', '环境', '计划状态', '运行快照', '快照审批人', '快照审批时间', '当前灰度', '受众规则(快照)', '依赖条件(快照)', '回滚阈值(快照)', '断链依赖', '负责人', '团队'],
+      ...reportRows.map((row) => [
+        row.flagKey,
+        row.flagName,
+        environmentLabel[row.environment],
+        row.envPlan ? envStatusLabel[row.envPlan.status] : '待审批',
+        row.snapshot ? `v${row.snapshot.version}` : '无快照',
+        row.snapshot?.approvedBy ?? '-',
+        row.snapshot ? row.snapshot.approvedAt.slice(0, 16).replace('T', ' ') : '-',
+        row.envPlan ? `${currentPercentage(row.envPlan)}%` : '-',
+        row.snapshot
+          ? row.snapshot.audienceRules.map((rule) => `${rule.negate ? '排除' : ''}${rule.attribute}${rule.operator}${rule.value}`).join('|') || '全部用户'
+          : '-',
+        row.snapshot
+          ? row.snapshot.dependencies.map((dependency) => `${dependency.type}:${dependency.condition}`).join('|') || '无'
+          : '-',
+        row.snapshot ? row.snapshot.rollbackConditions.join('|') : '-',
+        row.envPlan?.brokenLinks.map((link) => link.dependencyKey).join('|') || '无',
+        row.owner,
+        row.team,
       ]),
     ]
     const csv = `\uFEFF${rows.map((row) => row.map(escapeCsv).join(',')).join('\n')}`
@@ -63,13 +135,14 @@ export function ReportsPage() {
     anchor.download = `feature-flag-release-report-${new Date().toISOString().slice(0, 10)}.csv`
     anchor.click()
     URL.revokeObjectURL(url)
-    setMessage('发布报告已导出')
+    setMessage('发布报告已导出，内容按各环境实际运行快照生成')
   }
 
-  const riskFlags = reportFlags.filter((flag) => {
+  const riskFlags = flags.filter((flag) => {
     const flagIssues = issues.filter((issue) => issue.flagId === flag.id && !issue.resolved)
     return flagIssues.some((issue) => issue.severity === 'blocker')
   })
+  const brokenLinkCount = reportRows.reduce((sum, row) => sum + (row.envPlan?.brokenLinks.length ?? 0), 0)
 
   return (
     <Box>
@@ -77,7 +150,7 @@ export function ReportsPage() {
         <Box>
           <Typography variant="h2">发布报告</Typography>
           <Typography color="text.secondary">
-            汇总开关配置、影响评审问题、灰度状态与审计轨迹，导出可归档的发布报告。
+            按各环境实际运行的审批快照汇总配置、灰度与断链情况，导出可归档的发布报告。
           </Typography>
         </Box>
         <Stack direction="row" spacing={1}>
@@ -101,12 +174,12 @@ export function ReportsPage() {
           <AssessmentOutlinedIcon />
           <Box>
             <Typography variant="caption">报告范围</Typography>
-            <Typography className="summary-value">{reportFlags.length} 个开关</Typography>
+            <Typography className="summary-value">{reportRows.length} 条环境记录</Typography>
           </Box>
         </Box>
-        <Box><Typography variant="caption">生产已启用</Typography><Typography className="summary-value">{reportFlags.filter((flag) => flag.enabled).length}</Typography></Box>
+        <Box><Typography variant="caption">生产已启用</Typography><Typography className="summary-value">{flags.filter((flag) => flag.enabled).length}</Typography></Box>
         <Box><Typography variant="caption">未解决阻断项</Typography><Typography className="summary-value danger">{riskFlags.length}</Typography></Box>
-        <Box><Typography variant="caption">审计事件</Typography><Typography className="summary-value">{audit.length}</Typography></Box>
+        <Box><Typography variant="caption">断链环境</Typography><Typography className="summary-value danger">{brokenLinkCount}</Typography></Box>
         <Box><Typography variant="caption">影响用户</Typography><Typography className="summary-value">{(dashboard?.affectedUsers ?? 0).toLocaleString()}</Typography></Box>
       </Box>
 
@@ -146,36 +219,73 @@ export function ReportsPage() {
 
       <Card>
         <CardContent>
-          <Typography variant="h3" sx={{ mb: 1.5 }}>发布明细</Typography>
+          <Typography variant="h3" sx={{ mb: 1.5 }}>发布明细（按环境运行快照）</Typography>
           <TableContainer>
             <Table>
               <TableHead>
                 <TableRow>
                   <TableCell>功能开关</TableCell>
-                  <TableCell>环境 / 状态</TableCell>
-                  <TableCell>灰度</TableCell>
-                  <TableCell>影响规则</TableCell>
-                  <TableCell>监控与回滚</TableCell>
+                  <TableCell>环境 / 计划状态</TableCell>
+                  <TableCell>运行快照</TableCell>
+                  <TableCell>当前灰度</TableCell>
+                  <TableCell>快照封存的规则与阈值</TableCell>
+                  <TableCell>断链</TableCell>
                   <TableCell>最后变更</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
-                {reportFlags.map((flag) => (
-                  <TableRow key={flag.id} hover>
+                {reportRows.map((row) => (
+                  <TableRow key={`${row.flagId}-${row.environment}`} hover>
                     <TableCell>
-                      <Typography variant="body2" fontWeight={700}>{flag.name}</Typography>
-                      <Typography variant="caption" color="text.secondary">{flag.key}</Typography>
+                      <Typography variant="body2" fontWeight={700}>{row.flagName}</Typography>
+                      <Typography variant="caption" color="text.secondary">{row.flagKey}</Typography>
+                      <Box sx={{ mt: 0.5 }}>
+                        <FlagStatusChip status={flags.find((flag) => flag.id === row.flagId)?.status ?? 'draft'} />
+                      </Box>
                     </TableCell>
                     <TableCell>
-                      <Chip size="small" variant="outlined" label={flag.environment.toUpperCase()} />
-                      <Box sx={{ mt: 0.5 }}><FlagStatusChip status={flag.status} /></Box>
+                      <Chip size="small" variant="outlined" label={row.environment.toUpperCase()} />
+                      <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+                        {row.envPlan ? envStatusLabel[row.envPlan.status] : '待审批'}
+                      </Typography>
                     </TableCell>
-                    <TableCell>{flag.rolloutPercentage}%</TableCell>
-                    <TableCell>{flag.audienceRules.length} 条规则 · {flag.regions.length} 地区</TableCell>
-                    <TableCell>{flag.metricNames.length} 指标 · {flag.rollbackConditions.length} 回滚条件</TableCell>
                     <TableCell>
-                      <Typography variant="body2">{flag.lastChangedBy}</Typography>
-                      <Typography variant="caption" color="text.secondary">{flag.updatedAt.slice(0, 16).replace('T', ' ')}</Typography>
+                      {row.snapshot ? (
+                        <>
+                          <Typography variant="body2" fontWeight={700}>v{row.snapshot.version}</Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {row.snapshot.approvedBy} · {row.snapshot.approvedAt.slice(0, 16).replace('T', ' ')}
+                          </Typography>
+                        </>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">无快照</Typography>
+                      )}
+                    </TableCell>
+                    <TableCell>{row.envPlan ? `${currentPercentage(row.envPlan)}%` : '-'}</TableCell>
+                    <TableCell>
+                      {row.snapshot ? (
+                        <Typography variant="body2">
+                          {row.snapshot.audienceRules.length} 条规则 · {row.snapshot.dependencies.length} 项依赖 · {row.snapshot.rollbackConditions.length} 条回滚阈值
+                        </Typography>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">-</Typography>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {row.envPlan && row.envPlan.brokenLinks.length > 0 ? (
+                        <Chip
+                          size="small"
+                          color="error"
+                          icon={<LinkOffOutlinedIcon />}
+                          label={row.envPlan.brokenLinks.map((link) => link.dependencyKey).join('、')}
+                        />
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">无</Typography>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="body2">{row.owner}</Typography>
+                      <Typography variant="caption" color="text.secondary">{row.team}</Typography>
                     </TableCell>
                   </TableRow>
                 ))}

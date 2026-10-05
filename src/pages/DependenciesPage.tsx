@@ -19,13 +19,16 @@ import {
 } from '@mui/material'
 import AccountTreeOutlinedIcon from '@mui/icons-material/AccountTreeOutlined'
 import EditOutlinedIcon from '@mui/icons-material/EditOutlined'
+import LinkOffOutlinedIcon from '@mui/icons-material/LinkOffOutlined'
 import { Link } from 'react-router-dom'
-import { useGetFlagsQuery } from '@/services/flagApi'
+import { useGetFlagsQuery, useGetReleasePlansQuery } from '@/services/flagApi'
+import { environmentLabel } from '@/services/database'
 import { DependencyGraph } from '@/components/DependencyGraph'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
 
 export function DependenciesPage() {
   const { data: flags = [], isLoading } = useGetFlagsQuery({})
+  const { data: plans = [] } = useGetReleasePlansQuery()
   const [selectedId, setSelectedId] = useState('')
 
   useEffect(() => {
@@ -39,6 +42,11 @@ export function DependenciesPage() {
       .map((dependency) => ({ source: flag, target: flags.find((item) => item.id === dependency.flagId), dependency })),
   )
   const activeConflicts = conflicts.filter((item) => item.source.enabled && item.target?.enabled)
+  const brokenLinks = plans.flatMap((plan) =>
+    plan.environments.flatMap((env) =>
+      env.brokenLinks.map((link) => ({ plan, env, link })),
+    ),
+  )
 
   return (
     <Box>
@@ -67,6 +75,12 @@ export function DependenciesPage() {
       ) : (
         <Alert severity="success" sx={{ mb: 2 }}>
           当前已启用开关之间没有直接互斥冲突。
+        </Alert>
+      )}
+
+      {brokenLinks.length > 0 && (
+        <Alert severity="error" icon={<LinkOffOutlinedIcon />} sx={{ mb: 2 }}>
+          {brokenLinks.length} 处依赖断链：依赖开关已回滚，受影响的发布计划已按环境停止下一阶段。
         </Alert>
       )}
 
@@ -138,6 +152,47 @@ export function DependenciesPage() {
                 ))}
                 {!isLoading && conflicts.length === 0 && (
                   <TableRow><TableCell colSpan={5} align="center" sx={{ py: 5 }}>未配置冲突关系</TableCell></TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </CardContent>
+      </Card>
+
+      <Card sx={{ mt: 2 }}>
+        <CardContent>
+          <Typography variant="h3" sx={{ mb: 1.5 }}>依赖断链追踪</Typography>
+          <TableContainer>
+            <Table>
+              <TableHead>
+                <TableRow>
+                  <TableCell>受影响发布计划</TableCell>
+                  <TableCell>环境</TableCell>
+                  <TableCell>断链依赖</TableCell>
+                  <TableCell>原因</TableCell>
+                  <TableCell>检测时间</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {brokenLinks.map(({ plan, env, link }) => (
+                  <TableRow key={`${plan.id}-${env.environment}-${link.dependencyFlagId}`} hover>
+                    <TableCell>
+                      <Typography component={Link} to={`/flags/${plan.flagId}`} variant="body2" fontWeight={700}>
+                        {plan.flagKey}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Chip size="small" variant="outlined" label={environmentLabel[env.environment]} />
+                    </TableCell>
+                    <TableCell>
+                      <Chip size="small" color="error" icon={<LinkOffOutlinedIcon />} label={`${link.dependencyName} 已回滚`} />
+                    </TableCell>
+                    <TableCell>{link.reason}</TableCell>
+                    <TableCell>{link.detectedAt.slice(0, 16).replace('T', ' ')}</TableCell>
+                  </TableRow>
+                ))}
+                {brokenLinks.length === 0 && (
+                  <TableRow><TableCell colSpan={5} align="center" sx={{ py: 5 }}>当前没有依赖断链</TableCell></TableRow>
                 )}
               </TableBody>
             </Table>

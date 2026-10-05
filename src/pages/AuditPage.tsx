@@ -38,6 +38,9 @@ const actionLabel: Record<string, string> = {
   unfrozen: '解冻',
   'rolled-back': '回滚',
   'rollout-adjusted': '调整灰度',
+  'snapshot-created': '生成快照',
+  'plan-invalidated': '计划失效',
+  'dependency-broken': '依赖断链',
 }
 
 export function AuditPage() {
@@ -62,10 +65,14 @@ export function AuditPage() {
       return
     }
     try {
-      await rollbackFlag({ id: selectedFlag.id, actor: '林默', reason }).unwrap()
+      const result = await rollbackFlag({ id: selectedFlag.id, actor: '林默', reason }).unwrap()
       setSelectedFlagId('')
       setReason('')
-      setMessage('回滚已执行并写入审计记录')
+      setMessage(
+        result.impactedPlans.length > 0
+          ? `回滚已执行；${result.impactedPlans.length} 个依赖它的发布计划已按环境标出断链并停止下一阶段`
+          : '回滚已执行并写入审计记录',
+      )
     } catch {
       setMessage('回滚失败，请重试')
     }
@@ -172,7 +179,7 @@ export function AuditPage() {
       <Dialog open={Boolean(selectedFlag)} onClose={() => setSelectedFlagId('')} fullWidth maxWidth="sm">
         <DialogTitle>回滚 {selectedFlag?.name}</DialogTitle>
         <DialogContent dividers>
-          <Alert severity="error" sx={{ mb: 2 }}>回滚会关闭生产开关、停止灰度并写入审计日志。</Alert>
+          <Alert severity="error" sx={{ mb: 2 }}>回滚会关闭生产开关、停止灰度；依赖它的发布计划将按环境标出断链。</Alert>
           <TextField
             label="回滚原因"
             multiline

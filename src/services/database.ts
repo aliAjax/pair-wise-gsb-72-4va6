@@ -1,9 +1,16 @@
 import type {
   AuditEvent,
   DashboardData,
+  Environment,
+  EnvironmentPlan,
   FeatureFlag,
   ImpactIssue,
+  PlanStage,
+  ReleasePlan,
+  ReleasePlanStatus,
+  ReleaseSnapshot,
   ReviewPayload,
+  RolloutStep,
 } from '@/types'
 
 const STORAGE_KEY = 'feature-flag-release-console-v1'
@@ -12,6 +19,16 @@ export interface Database {
   flags: FeatureFlag[]
   audit: AuditEvent[]
   issues: ImpactIssue[]
+  snapshots: ReleaseSnapshot[]
+  plans: ReleasePlan[]
+}
+
+export const ENVIRONMENTS: Environment[] = ['dev', 'staging', 'production']
+
+export const environmentLabel: Record<Environment, string> = {
+  dev: '开发',
+  staging: '预发',
+  production: '生产',
 }
 
 const flags: FeatureFlag[] = [
@@ -367,7 +384,276 @@ const audit: AuditEvent[] = [
   },
 ]
 
-export const seedDatabase = (): Database => ({ flags, audit, issues })
+/* ------------------------------------------------------------------ */
+/* 发布快照与计划：构造、校验、恢复                                       */
+/* ------------------------------------------------------------------ */
+
+const deepCopy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
+
+const nowIso = () => new Date().toISOString()
+
+let auditSequence = 0
+
+const appendAudit = (db: Database, event: Omit<AuditEvent, 'id' | 'createdAt'>): void => {
+  auditSequence += 1
+  db.audit.unshift({ ...event, id: `audit-${Date.now()}-${auditSequence}`, createdAt: nowIso() })
+}
+
+/** 快照内容指纹：内容不可变，任何改动都会破坏校验和 */
+const checksumOf = (value: unknown): string => {
+  const text = JSON.stringify(value)
+  let hash = 5381
+  for (let index = 0; index < text.length; index += 1) {
+    hash = ((hash << 5) + hash + text.charCodeAt(index)) >>> 0
+  }
+  return hash.toString(16)
+}
+
+/**
+ * 纳入快照封存与漂移检测的配置项：受众规则、依赖条件、回滚阈值等。
+ * 灰度阶段只封存定义（比例、人群、守护），运行状态不属于配置内容，
+ * 冻结/回滚改变阶段状态不会误判为配置漂移。
+ */
+const snapshotContent = (flag: FeatureFlag) => ({
+  environment: flag.environment,
+  audienceRules: flag.audienceRules,
+  dependencies: flag.dependencies,
+  rollbackConditions: flag.rollbackConditions,
+  metricNames: flag.metricNames,
+  regions: flag.regions,
+  minClientVersion: flag.minClientVersion,
+  rolloutSteps: flag.rolloutSteps.map((step) => ({
+    id: step.id,
+    percentage: step.percentage,
+    audience: step.audience,
+    guardrails: step.guardrails,
+    startedAt: step.startedAt,
+  })),
+})
+
+const snapshotContentFromSnapshot = (snapshot: ReleaseSnapshot) => ({
+  environment: snapshot.environment,
+  audienceRules: snapshot.audienceRules,
+  dependencies: snapshot.dependencies,
+  rollbackConditions: snapshot.rollbackConditions,
+  metricNames: snapshot.metricNames,
+  regions: snapshot.regions,
+  minClientVersion: snapshot.minClientVersion,
+  rolloutSteps: snapshot.rolloutSteps.map((step) => ({
+    id: step.id,
+    percentage: step.percentage,
+    audience: step.audience,
+    guardrails: step.guardrails,
+    startedAt: step.startedAt,
+  })),
+})
+
+const snapshotChecksum = (flagId: string, version: number, flag: FeatureFlag): string =>
+  checksumOf({ flagId, version, ...snapshotContent(flag) })
+
+export const verifySnapshot = (snapshot: ReleaseSnapshot): boolean =>
+  snapshot.checksum === checksumOf({ flagId: snapshot.flagId, version: snapshot.version, ...snapshotContentFromSnapshot(snapshot) })
+
+/** 判断当前配置是否已偏离某个审批快照 */
+export const flagDriftedFromSnapshot = (snapshot: ReleaseSnapshot, flag: FeatureFlag): boolean =>
+  snapshot.checksum !== snapshotChecksum(flag.id, snapshot.version, flag)
+
+const buildSnapshot = (
+  flag: FeatureFlag,
+  version: number,
+  actor: string,
+  comment: string,
+  approvedAt = nowIso(),
+): ReleaseSnapshot => ({
+  id: `snap-${flag.id}-v${version}`,
+  flagId: flag.id,
+  flagKey: flag.key,
+  version,
+  status: 'active',
+  approvedBy: actor,
+  approvedAt,
+  comment,
+  rolloutPercentage: flag.rolloutPercentage,
+  environment: flag.environment,
+  audienceRules: deepCopy(flag.audienceRules),
+  dependencies: deepCopy(flag.dependencies),
+  rollbackConditions: [...flag.rollbackConditions],
+  metricNames: [...flag.metricNames],
+  regions: [...flag.regions],
+  minClientVersion: { ...flag.minClientVersion },
+  rolloutSteps: deepCopy(flag.rolloutSteps),
+  checksum: snapshotChecksum(flag.id, version, flag),
+})
+
+const stageFromStep = (step: RolloutStep, status: PlanStage['status']): PlanStage => ({
+  id: step.id,
+  percentage: step.percentage,
+  audience: step.audience,
+  guardrails: [...step.guardrails],
+  status,
+})
+
+const buildStagesFromSnapshot = (snapshot: ReleaseSnapshot): PlanStage[] =>
+  snapshot.rolloutSteps.map((step) => stageFromStep(step, 'planned'))
+
+/** 环境是否已推进：只要存在已开始的阶段，就固定按当前快照运行 */
+export const isEnvironmentAdvanced = (plan: EnvironmentPlan): boolean =>
+  plan.stages.some((stage) => stage.status !== 'planned')
+
+const environmentStatusFromStages = (stages: PlanStage[]): EnvironmentPlan['status'] => {
+  if (stages.length === 0) return 'pending'
+  if (stages.every((stage) => stage.status === 'completed')) return 'completed'
+  if (stages.some((stage) => stage.status === 'running')) return 'in-progress'
+  if (stages.some((stage) => stage.status === 'paused')) return 'paused'
+  return 'pending'
+}
+
+const derivePlanStatus = (environments: EnvironmentPlan[]): ReleasePlanStatus => {
+  if (environments.length > 0 && environments.every((env) => env.status === 'completed')) return 'completed'
+  if (environments.length > 0 && environments.every((env) => env.status === 'invalidated')) return 'invalidated'
+  if (environments.some((env) => env.status === 'halted')) return 'halted'
+  return 'in-progress'
+}
+
+const emptyEnvironmentPlan = (environment: Environment, snapshot: ReleaseSnapshot): EnvironmentPlan => ({
+  environment,
+  snapshotId: snapshot.id,
+  status: 'pending',
+  stages: buildStagesFromSnapshot(snapshot),
+  brokenLinks: [],
+  updatedAt: nowIso(),
+})
+
+/** 首次审批 / 历史数据迁移：按开关当前真实进度生成计划，已推进阶段保留状态 */
+const buildHistoricalPlan = (flag: FeatureFlag, snapshot: ReleaseSnapshot): ReleasePlan => {
+  const flagEnvironmentIndex = ENVIRONMENTS.indexOf(flag.environment)
+  const environments: EnvironmentPlan[] = ENVIRONMENTS.map((environment, index) => {
+    let stages: PlanStage[]
+    if (index < flagEnvironmentIndex) {
+      stages = snapshot.rolloutSteps.map((step) => stageFromStep(step, 'completed'))
+    } else if (index === flagEnvironmentIndex) {
+      stages = snapshot.rolloutSteps.map((step) =>
+        stageFromStep(
+          step,
+          step.status === 'completed' || step.status === 'running' || step.status === 'paused'
+            ? step.status
+            : 'planned',
+        ),
+      )
+    } else {
+      stages = buildStagesFromSnapshot(snapshot)
+    }
+    return {
+      environment,
+      snapshotId: snapshot.id,
+      status: environmentStatusFromStages(stages),
+      stages,
+      brokenLinks: [],
+      updatedAt: nowIso(),
+    }
+  })
+  const plan: ReleasePlan = {
+    id: `plan-${flag.id}`,
+    flagId: flag.id,
+    flagKey: flag.key,
+    snapshotId: snapshot.id,
+    status: derivePlanStatus(environments),
+    environments,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  }
+  if (flag.status === 'rolled-back') {
+    plan.environments.forEach((env) => {
+      if (env.status !== 'completed') env.status = 'halted'
+    })
+    plan.status = derivePlanStatus(plan.environments)
+  }
+  return plan
+}
+
+const latestCompleteSnapshot = (db: Database, flagId: string): ReleaseSnapshot | undefined =>
+  db.snapshots
+    .filter((snapshot) => snapshot.flagId === flagId)
+    .sort((left, right) => right.version - left.version)[0]
+
+const seedSnapshotsAndPlans = (seedFlags: FeatureFlag[]): { snapshots: ReleaseSnapshot[]; plans: ReleasePlan[] } => {
+  const snapshots: ReleaseSnapshot[] = []
+  const plans: ReleasePlan[] = []
+  seedFlags.forEach((flag) => {
+    if (flag.status === 'active' || flag.status === 'frozen' || flag.status === 'rolled-back') {
+      const snapshot = buildSnapshot(flag, 1, flag.lastChangedBy, '基线审批快照', flag.updatedAt)
+      snapshots.push(snapshot)
+      plans.push(buildHistoricalPlan(flag, snapshot))
+    }
+  })
+  return { snapshots, plans }
+}
+
+export const seedDatabase = (): Database => {
+  const { snapshots, plans } = seedSnapshotsAndPlans(flags)
+  return deepCopy({ flags, audit, issues, snapshots, plans })
+}
+
+/** 旧版本数据迁移：没有快照概念的数据，为已审批过的开关补建基线快照与计划 */
+const migrateDatabase = (raw: Partial<Database>): Database => {
+  const db: Database = {
+    flags: Array.isArray(raw.flags) ? raw.flags : [],
+    audit: Array.isArray(raw.audit) ? raw.audit : [],
+    issues: Array.isArray(raw.issues) ? raw.issues : [],
+    snapshots: Array.isArray(raw.snapshots) ? raw.snapshots : [],
+    plans: Array.isArray(raw.plans) ? raw.plans : [],
+  }
+  if (!Array.isArray(raw.snapshots) || !Array.isArray(raw.plans)) {
+    const seeded = seedSnapshotsAndPlans(db.flags)
+    db.snapshots = seeded.snapshots
+    db.plans = seeded.plans
+  }
+  return db
+}
+
+/** 启动时修复：残缺快照与半套计划一律回退，从上一个完整快照继续 */
+const recoverDatabase = (db: Database): boolean => {
+  let repaired = false
+  const validSnapshots = db.snapshots.filter(verifySnapshot)
+  if (validSnapshots.length !== db.snapshots.length) {
+    db.snapshots = validSnapshots
+    repaired = true
+  }
+  const snapshotIds = new Set(db.snapshots.map((snapshot) => snapshot.id))
+  db.plans = db.plans.filter((plan) => {
+    if (!db.flags.some((flag) => flag.id === plan.flagId)) {
+      repaired = true
+      return false
+    }
+    const fallback = latestCompleteSnapshot(db, plan.flagId)
+    if (!fallback) {
+      // 没有任何完整快照可用，半套计划直接移除
+      repaired = true
+      return false
+    }
+    if (!snapshotIds.has(plan.snapshotId)) {
+      plan.snapshotId = fallback.id
+      repaired = true
+    }
+    plan.environments.forEach((env) => {
+      if (snapshotIds.has(env.snapshotId)) return
+      const previousStages = Array.isArray(env.stages) ? env.stages : []
+      env.snapshotId = fallback.id
+      env.stages = fallback.rolloutSteps.map((step) => {
+        const previous = previousStages.find((stage) => stage.id === step.id)
+        return stageFromStep(step, previous?.status ?? 'planned')
+      })
+      env.brokenLinks = []
+      env.status = environmentStatusFromStages(env.stages)
+      env.updatedAt = nowIso()
+      repaired = true
+    })
+    plan.status = derivePlanStatus(plan.environments)
+    plan.updatedAt = nowIso()
+    return true
+  })
+  return repaired
+}
 
 export const readDatabase = (): Database => {
   const raw = localStorage.getItem(STORAGE_KEY)
@@ -377,7 +663,9 @@ export const readDatabase = (): Database => {
     return seed
   }
   try {
-    return JSON.parse(raw) as Database
+    const db = migrateDatabase(JSON.parse(raw) as Partial<Database>)
+    if (recoverDatabase(db)) writeDatabase(db)
+    return db
   } catch {
     const seed = seedDatabase()
     writeDatabase(seed)
@@ -389,62 +677,435 @@ export const writeDatabase = (database: Database): void => {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(database))
 }
 
-export const applyReview = (flagId: string, payload: ReviewPayload): FeatureFlag => {
-  const db = readDatabase()
-  const flag = db.flags.find((item) => item.id === flagId)
-  if (!flag) throw new Error('功能开关不存在')
-  const before = flag.status
-  flag.status = payload.decision === 'approved' ? 'active' : 'draft'
-  flag.enabled = payload.decision === 'approved'
-  flag.updatedAt = new Date().toISOString()
-  flag.lastChangedBy = payload.reviewer
-  db.audit.unshift({
-    id: `audit-${Date.now()}`,
-    flagId,
-    flagKey: flag.key,
-    action: payload.decision,
-    actor: payload.reviewer,
-    summary: payload.comment,
-    before,
-    after: flag.status,
-    affectedUsers: Math.round(120000 * (flag.rolloutPercentage / 100)),
-    createdAt: new Date().toISOString(),
-  })
-  if (payload.freezeUntil && payload.decision === 'approved') {
-    flag.rollbackConditions.push(`冻结至 ${payload.freezeUntil}，期间禁止扩大流量`)
+/** 写入前完整性校验：任何快照或计划引用缺失都放弃本次写入 */
+const assertIntegrity = (db: Database): void => {
+  const snapshotIds = new Set(db.snapshots.map((snapshot) => snapshot.id))
+  for (const snapshot of db.snapshots) {
+    if (!verifySnapshot(snapshot)) {
+      throw new Error(`快照 ${snapshot.id} 内容校验失败，已放弃本次写入`)
+    }
   }
-  writeDatabase(db)
-  return flag
+  for (const plan of db.plans) {
+    if (!snapshotIds.has(plan.snapshotId)) {
+      throw new Error(`发布计划 ${plan.id} 引用的快照缺失，已放弃本次写入`)
+    }
+    for (const env of plan.environments) {
+      if (!snapshotIds.has(env.snapshotId)) {
+        throw new Error(`${environmentLabel[env.environment]}环境计划引用的快照缺失，已放弃本次写入`)
+      }
+    }
+  }
 }
 
-export const rollbackFlag = (flagId: string, actor: string, reason: string): FeatureFlag => {
+/**
+ * 事务化写入：先在内存副本上完成全部变更并通过完整性校验，
+ * 最后一次落盘；任何一步失败都不写盘，不会留下半套计划。
+ */
+const transaction = <T>(mutate: (db: Database) => T): T => {
   const db = readDatabase()
-  const flag = db.flags.find((item) => item.id === flagId)
-  if (!flag) throw new Error('功能开关不存在')
-  const before = `${flag.status} / ${flag.rolloutPercentage}%`
-  flag.status = 'rolled-back'
-  flag.enabled = false
-  flag.rolloutPercentage = 0
-  flag.updatedAt = new Date().toISOString()
-  flag.lastChangedBy = actor
-  flag.rolloutSteps.forEach((step) => {
-    if (step.status === 'running') step.status = 'paused'
-  })
-  db.audit.unshift({
-    id: `audit-${Date.now()}`,
-    flagId,
-    flagKey: flag.key,
-    action: 'rolled-back',
-    actor,
-    summary: reason,
-    before,
-    after: 'rolled-back / 0%',
-    affectedUsers: Math.round(980000 * (flag.rolloutPercentage / 100)),
-    createdAt: new Date().toISOString(),
-  })
+  const result = mutate(db)
+  assertIntegrity(db)
   writeDatabase(db)
-  return flag
+  return result
 }
+
+/* ------------------------------------------------------------------ */
+/* 业务操作                                                             */
+/* ------------------------------------------------------------------ */
+
+export const applyReview = (
+  flagId: string,
+  payload: ReviewPayload,
+): { flag: FeatureFlag; snapshot: ReleaseSnapshot | null } =>
+  transaction((db) => {
+    const flag = db.flags.find((item) => item.id === flagId)
+    if (!flag) throw new Error('功能开关不存在')
+    const before = flag.status
+    const now = nowIso()
+    flag.updatedAt = now
+    flag.lastChangedBy = payload.reviewer
+
+    if (payload.decision !== 'approved') {
+      flag.status = 'draft'
+      flag.enabled = false
+      appendAudit(db, {
+        flagId,
+        flagKey: flag.key,
+        action: 'rejected',
+        actor: payload.reviewer,
+        summary: payload.comment,
+        before,
+        after: flag.status,
+        affectedUsers: 0,
+      })
+      return { flag, snapshot: null }
+    }
+
+    if (payload.freezeUntil) {
+      flag.rollbackConditions.push(`冻结至 ${payload.freezeUntil}，期间禁止扩大流量`)
+    }
+    flag.status = 'active'
+    flag.enabled = true
+
+    // 每次批准生成不可变快照：受众规则、依赖条件、回滚阈值一并封存
+    const version =
+      db.snapshots
+        .filter((snapshot) => snapshot.flagId === flagId)
+        .reduce((max, snapshot) => Math.max(max, snapshot.version), 0) + 1
+    const snapshot = buildSnapshot(flag, version, payload.reviewer, payload.comment, now)
+    db.snapshots.forEach((item) => {
+      if (item.flagId === flagId && item.status === 'active') item.status = 'superseded'
+    })
+    db.snapshots.unshift(snapshot)
+
+    // 发布计划：未推进环境换绑新快照，已推进环境继续按各自快照运行
+    const existingPlan = db.plans.find((item) => item.flagId === flagId)
+    if (!existingPlan) {
+      db.plans.unshift(buildHistoricalPlan(flag, snapshot))
+    } else {
+      const plan = existingPlan
+      plan.snapshotId = snapshot.id
+      plan.environments.forEach((env) => {
+        if (isEnvironmentAdvanced(env)) return
+        env.snapshotId = snapshot.id
+        env.stages = buildStagesFromSnapshot(snapshot)
+        env.status = 'pending'
+        env.brokenLinks = []
+        env.updatedAt = now
+      })
+      ENVIRONMENTS.forEach((environment) => {
+        if (!plan.environments.some((env) => env.environment === environment)) {
+          plan.environments.push(emptyEnvironmentPlan(environment, snapshot))
+        }
+      })
+      plan.status = derivePlanStatus(plan.environments)
+      plan.updatedAt = now
+    }
+
+    appendAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'approved',
+      actor: payload.reviewer,
+      summary: payload.comment,
+      before,
+      after: flag.status,
+      affectedUsers: Math.round(120000 * (flag.rolloutPercentage / 100)),
+    })
+    appendAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'snapshot-created',
+      actor: payload.reviewer,
+      summary: `生成不可变发布快照 v${version}：受众规则 ${snapshot.audienceRules.length} 条、依赖条件 ${snapshot.dependencies.length} 项、回滚阈值 ${snapshot.rollbackConditions.length} 条。`,
+      before,
+      after: `snapshot v${version}`,
+      affectedUsers: 0,
+    })
+    return { flag, snapshot }
+  })
+
+export const saveFlagConfig = (
+  input: FeatureFlag,
+): { flag: FeatureFlag; invalidatedEnvironments: Environment[] } =>
+  transaction((db) => {
+    const now = nowIso()
+    const next = { ...input, updatedAt: now }
+    const index = db.flags.findIndex((item) => item.id === input.id)
+    const invalidatedEnvironments: Environment[] = []
+
+    if (index < 0) {
+      db.flags.unshift(next)
+      appendAudit(db, {
+        flagId: next.id,
+        flagKey: next.key,
+        action: 'created',
+        actor: next.lastChangedBy,
+        summary: '创建功能开关草稿。',
+        after: next.status,
+        affectedUsers: 0,
+      })
+      return { flag: next, invalidatedEnvironments }
+    }
+
+    const before = db.flags[index]
+    db.flags[index] = next
+    appendAudit(db, {
+      flagId: next.id,
+      flagKey: next.key,
+      action: 'updated',
+      actor: next.lastChangedBy,
+      summary: '更新开关受众、依赖、版本或回滚条件。',
+      before: before.status,
+      after: next.status,
+      affectedUsers: Math.round(900000 * (next.rolloutPercentage / 100)),
+    })
+
+    // 审批后配置更新：未推进环境的发布计划失效重审，已推进环境继续按各自快照运行
+    const activeSnapshot =
+      db.snapshots.find((snapshot) => snapshot.flagId === next.id && snapshot.status === 'active') ??
+      latestCompleteSnapshot(db, next.id)
+    const plan = db.plans.find((item) => item.flagId === next.id)
+    if (activeSnapshot && plan && flagDriftedFromSnapshot(activeSnapshot, next)) {
+      plan.environments.forEach((env) => {
+        if (isEnvironmentAdvanced(env) || env.status === 'invalidated' || env.status === 'halted') return
+        env.status = 'invalidated'
+        env.updatedAt = now
+        invalidatedEnvironments.push(env.environment)
+      })
+      if (invalidatedEnvironments.length > 0) {
+        plan.status = derivePlanStatus(plan.environments)
+        plan.updatedAt = now
+        next.status = 'review'
+        db.flags[index] = next
+        appendAudit(db, {
+          flagId: next.id,
+          flagKey: next.key,
+          action: 'plan-invalidated',
+          actor: next.lastChangedBy,
+          summary: `审批后配置发生变更，${invalidatedEnvironments.map((env) => environmentLabel[env]).join('、')}环境发布计划失效，需重新评审；已推进环境继续按原快照运行。`,
+          before: before.status,
+          after: 'review',
+          affectedUsers: 0,
+        })
+      }
+    }
+    return { flag: next, invalidatedEnvironments }
+  })
+
+export const submitFlagForReview = (flagId: string, actor: string): FeatureFlag =>
+  transaction((db) => {
+    const flag = db.flags.find((item) => item.id === flagId)
+    if (!flag) throw new Error('功能开关不存在')
+    const before = flag.status
+    flag.status = 'review'
+    flag.updatedAt = nowIso()
+    flag.lastChangedBy = actor
+    appendAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'submitted',
+      actor,
+      summary: '提交发布影响评审。',
+      before,
+      after: 'review',
+      affectedUsers: Math.round(900000 * (flag.rolloutPercentage / 100)),
+    })
+    return flag
+  })
+
+const currentStagePercentage = (env: EnvironmentPlan): number => {
+  const active = [...env.stages]
+    .reverse()
+    .find((stage) => stage.status === 'running' || stage.status === 'completed')
+  return active?.percentage ?? 0
+}
+
+export const advanceEnvironment = (flagId: string, environment: Environment, actor: string): ReleasePlan =>
+  transaction((db) => {
+    const flag = db.flags.find((item) => item.id === flagId)
+    if (!flag) throw new Error('功能开关不存在')
+    const plan = db.plans.find((item) => item.flagId === flagId)
+    if (!plan) throw new Error('发布计划不存在，请先完成审批生成快照')
+    const env = plan.environments.find((item) => item.environment === environment)
+    if (!env) throw new Error('该环境暂无发布计划')
+    if (env.status === 'invalidated') throw new Error('该环境发布计划已失效，需重新评审后再推进')
+    if (env.status === 'halted') throw new Error('该环境已因回滚停止，无法推进')
+    if (env.status === 'paused') throw new Error('该环境处于冻结状态，无法推进')
+    if (env.status === 'completed') throw new Error('该环境全部阶段已完成')
+    if (env.brokenLinks.length > 0) {
+      throw new Error(`依赖 ${env.brokenLinks.map((link) => link.dependencyKey).join('、')} 已回滚，断链未处理，已停止推进`)
+    }
+    const snapshot = db.snapshots.find((item) => item.id === env.snapshotId)
+    if (!snapshot) throw new Error('环境运行快照缺失，已停止推进')
+
+    const now = nowIso()
+    const beforePercentage = currentStagePercentage(env)
+    const running = env.stages.find((stage) => stage.status === 'running')
+    if (running) {
+      running.status = 'completed'
+      running.completedAt = now
+    }
+    const next = env.stages.find((stage) => stage.status === 'planned')
+    if (next) {
+      next.status = 'running'
+      next.startedAt = now
+      env.status = 'in-progress'
+    } else {
+      env.status = 'completed'
+    }
+    env.updatedAt = now
+    plan.status = derivePlanStatus(plan.environments)
+    plan.updatedAt = now
+
+    const afterPercentage = currentStagePercentage(env)
+    if (environment === flag.environment) {
+      flag.rolloutPercentage = afterPercentage
+      flag.enabled = true
+      if (flag.status !== 'frozen') flag.status = 'active'
+      flag.updatedAt = now
+      flag.lastChangedBy = actor
+    }
+    appendAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'rollout-adjusted',
+      actor,
+      summary: `${environmentLabel[environment]}环境按快照 v${snapshot.version} 推进至 ${afterPercentage}%。`,
+      before: `${beforePercentage}%`,
+      after: `${afterPercentage}%`,
+      affectedUsers: Math.round(900000 * (afterPercentage / 100)),
+    })
+    return plan
+  })
+
+export const freezeRollout = (flagId: string, actor: string): FeatureFlag =>
+  transaction((db) => {
+    const flag = db.flags.find((item) => item.id === flagId)
+    if (!flag) throw new Error('功能开关不存在')
+    const now = nowIso()
+    const before = flag.status
+    flag.status = 'frozen'
+    flag.updatedAt = now
+    flag.lastChangedBy = actor
+    flag.rolloutSteps.forEach((step) => {
+      if (step.status === 'running') step.status = 'paused'
+    })
+    const plan = db.plans.find((item) => item.flagId === flagId)
+    plan?.environments.forEach((env) => {
+      let touched = false
+      env.stages.forEach((stage) => {
+        if (stage.status === 'running') {
+          stage.status = 'paused'
+          touched = true
+        }
+      })
+      if (touched || env.status === 'in-progress') {
+        env.status = 'paused'
+        env.updatedAt = now
+      }
+    })
+    if (plan) {
+      plan.status = derivePlanStatus(plan.environments)
+      plan.updatedAt = now
+    }
+    appendAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'frozen',
+      actor,
+      summary: '冻结灰度流量，运行中阶段全部暂停。',
+      before,
+      after: 'frozen',
+      affectedUsers: Math.round(900000 * (flag.rolloutPercentage / 100)),
+    })
+    return flag
+  })
+
+export const rollbackFlag = (
+  flagId: string,
+  actor: string,
+  reason: string,
+): { flag: FeatureFlag; impactedPlans: string[] } =>
+  transaction((db) => {
+    const flag = db.flags.find((item) => item.id === flagId)
+    if (!flag) throw new Error('功能开关不存在')
+    const now = nowIso()
+    const before = `${flag.status} / ${flag.rolloutPercentage}%`
+    const affectedUsers = Math.round(980000 * (flag.rolloutPercentage / 100))
+    flag.status = 'rolled-back'
+    flag.enabled = false
+    flag.rolloutPercentage = 0
+    flag.updatedAt = now
+    flag.lastChangedBy = actor
+    flag.rolloutSteps.forEach((step) => {
+      if (step.status === 'running') step.status = 'paused'
+    })
+
+    // 自身发布计划停止推进
+    const ownPlan = db.plans.find((item) => item.flagId === flagId)
+    ownPlan?.environments.forEach((env) => {
+      env.stages.forEach((stage) => {
+        if (stage.status === 'running') stage.status = 'paused'
+      })
+      if (env.status !== 'completed') {
+        env.status = 'halted'
+        env.updatedAt = now
+      }
+    })
+    if (ownPlan) {
+      ownPlan.status = derivePlanStatus(ownPlan.environments)
+      ownPlan.updatedAt = now
+    }
+
+    // 依赖它的发布计划：按环境标出断链并停止下一阶段
+    const impactedPlans: string[] = []
+    db.plans.forEach((plan) => {
+      if (plan.flagId === flagId) return
+      const impactedEnvironments: string[] = []
+      plan.environments.forEach((env) => {
+        if (env.status === 'completed' || env.status === 'halted') return
+        const snapshot = db.snapshots.find((item) => item.id === env.snapshotId)
+        if (!snapshot) return
+        const dependency = snapshot.dependencies.find(
+          (item) => item.flagId === flagId && (item.type === 'requires' || item.type === 'fallback'),
+        )
+        if (!dependency) return
+        if (env.brokenLinks.some((link) => link.dependencyFlagId === flagId)) return
+        env.brokenLinks.push({
+          dependencyFlagId: flagId,
+          dependencyKey: flag.key,
+          dependencyName: flag.name,
+          reason: `依赖开关已回滚：${reason}`,
+          detectedAt: now,
+        })
+        env.updatedAt = now
+        impactedEnvironments.push(environmentLabel[env.environment])
+      })
+      if (impactedEnvironments.length > 0) {
+        plan.updatedAt = now
+        impactedPlans.push(plan.flagKey)
+        appendAudit(db, {
+          flagId: plan.flagId,
+          flagKey: plan.flagKey,
+          action: 'dependency-broken',
+          actor,
+          summary: `依赖开关 ${flag.key} 已回滚，${impactedEnvironments.join('、')}环境出现断链，下一阶段已停止。`,
+          before: plan.status,
+          after: '断链',
+          affectedUsers: 0,
+        })
+      }
+    })
+
+    appendAudit(db, {
+      flagId,
+      flagKey: flag.key,
+      action: 'rolled-back',
+      actor,
+      summary: reason,
+      before,
+      after: 'rolled-back / 0%',
+      affectedUsers,
+    })
+    return { flag, impactedPlans }
+  })
+
+export const resolveIssue = (issueId: string, actor: string): ImpactIssue =>
+  transaction((db) => {
+    const issue = db.issues.find((item) => item.id === issueId)
+    if (!issue) throw new Error('影响问题不存在')
+    issue.resolved = true
+    appendAudit(db, {
+      flagId: issue.flagId,
+      flagKey: issue.flagKey,
+      action: 'updated',
+      actor,
+      summary: `影响问题「${issue.title}」已标记解决。`,
+      affectedUsers: 0,
+    })
+    return issue
+  })
 
 export const getDashboardStats = (): DashboardData => {
   const db = readDatabase()
@@ -453,6 +1114,13 @@ export const getDashboardStats = (): DashboardData => {
     pendingReview: db.flags.filter((flag) => flag.status === 'review').length + 2,
     blockerIssues: db.issues.filter((issue) => issue.severity === 'blocker' && !issue.resolved).length,
     affectedUsers: 5246900,
+    brokenLinks: db.plans.reduce(
+      (sum, plan) => sum + plan.environments.reduce((inner, env) => inner + env.brokenLinks.length, 0),
+      0,
+    ),
+    invalidatedPlans: db.plans.filter((plan) =>
+      plan.environments.some((env) => env.status === 'invalidated'),
+    ).length,
     environmentDiff: [
       { flag: '极速支付流程 V2', dev: 100, staging: 20, production: 0 },
       { flag: '账单异步导出 V3', dev: 5, staging: 0, production: 0 },

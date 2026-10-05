@@ -28,7 +28,7 @@ import CancelOutlinedIcon from '@mui/icons-material/CancelOutlined'
 import WarningAmberOutlinedIcon from '@mui/icons-material/WarningAmberOutlined'
 import { useAppDispatch, useAppSelector } from '@/app/hooks'
 import { clearReviewSelection, toggleReviewSelection } from '@/app/uiSlice'
-import { useGetFlagsQuery, useGetIssuesQuery, useReviewFlagMutation } from '@/services/flagApi'
+import { useGetFlagsQuery, useGetIssuesQuery, useResolveIssueMutation, useReviewFlagMutation } from '@/services/flagApi'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
 import type { FeatureFlag, IssueSeverity } from '@/types'
 
@@ -44,6 +44,7 @@ export function ReviewPage() {
   const { data: flags = [], isLoading } = useGetFlagsQuery({ status: 'review' })
   const { data: issues = [] } = useGetIssuesQuery({ resolved: false })
   const [reviewFlag, reviewState] = useReviewFlagMutation()
+  const [resolveIssue, resolveState] = useResolveIssueMutation()
   const [dialogOpen, setDialogOpen] = useState(false)
   const [decision, setDecision] = useState<'approved' | 'rejected'>('approved')
   const [comment, setComment] = useState('')
@@ -75,7 +76,7 @@ export function ReviewPage() {
       return
     }
     try {
-      await reviewFlag({
+      const result = await reviewFlag({
         id: activeFlag.id,
         payload: {
           reviewer: '林默',
@@ -86,9 +87,22 @@ export function ReviewPage() {
       }).unwrap()
       setDialogOpen(false)
       dispatch(clearReviewSelection())
-      setMessage(decision === 'approved' ? '已批准发布，状态和影响范围已写入审计日志' : '已驳回并恢复为草稿')
+      setMessage(
+        decision === 'approved'
+          ? `已批准发布并生成不可变快照 v${result.snapshot?.version ?? '-'}，受众规则、依赖条件与回滚阈值已封存`
+          : '已驳回并恢复为草稿',
+      )
     } catch {
       setMessage('审批提交失败，请重试')
+    }
+  }
+
+  const markIssueResolved = async (issueId: string) => {
+    try {
+      await resolveIssue({ id: issueId, actor: '林默' }).unwrap()
+      setMessage('影响问题已标记解决')
+    } catch {
+      setMessage('操作失败，请重试')
     }
   }
 
@@ -194,9 +208,14 @@ export function ReviewPage() {
                   <Box key={issue.id} className={`issue-item ${issue.severity}`}>
                     <WarningAmberOutlinedIcon fontSize="small" />
                     <Box>
-                      <Stack direction="row" spacing={0.7} alignItems="center">
-                        <Chip size="small" label={severityLabel[issue.severity]} color={issue.severity === 'blocker' ? 'error' : issue.severity === 'warning' ? 'warning' : 'default'} />
-                        <Typography variant="body2" fontWeight={700}>{issue.title}</Typography>
+                      <Stack direction="row" spacing={0.7} alignItems="center" justifyContent="space-between">
+                        <Stack direction="row" spacing={0.7} alignItems="center">
+                          <Chip size="small" label={severityLabel[issue.severity]} color={issue.severity === 'blocker' ? 'error' : issue.severity === 'warning' ? 'warning' : 'default'} />
+                          <Typography variant="body2" fontWeight={700}>{issue.title}</Typography>
+                        </Stack>
+                        <Button size="small" disabled={resolveState.isLoading} onClick={() => void markIssueResolved(issue.id)}>
+                          标记解决
+                        </Button>
                       </Stack>
                       <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>{issue.detail}</Typography>
                       <Typography variant="caption" color="primary.main">{issue.suggestion}</Typography>
@@ -264,7 +283,7 @@ export function ReviewPage() {
                 <MenuItem value="2026-10-03 09:00">冻结至 10 月 3 日 09:00</MenuItem>
               </TextField>
               <Alert severity="info" sx={{ mt: 2 }}>
-                批准后会记录审批人、意见、配置前后状态和预估受影响用户数。
+                批准后会生成不可变发布快照，封存受众规则、依赖条件与回滚阈值；未推进环境按新快照执行，已推进环境继续按各自快照运行。
               </Alert>
             </>
           )}

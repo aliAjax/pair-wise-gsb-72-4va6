@@ -89,6 +89,34 @@ export function DashboardPage() {
         </Alert>
       )}
 
+      {(data?.brokenLinks ?? 0) > 0 && (
+        <Alert
+          severity="error"
+          action={
+            <Button component={Link} to="/rollout" color="inherit" size="small" endIcon={<ArrowForwardIcon />}>
+              查看发布计划
+            </Button>
+          }
+          sx={{ mb: 2, alignItems: 'center' }}
+        >
+          有 {data?.brokenLinks} 处依赖断链：依赖开关已回滚，相关发布计划已按环境停止下一阶段。
+        </Alert>
+      )}
+
+      {(data?.invalidatedPlans ?? 0) > 0 && (
+        <Alert
+          severity="warning"
+          action={
+            <Button component={Link} to="/review" color="inherit" size="small" endIcon={<ArrowForwardIcon />}>
+              重新评审
+            </Button>
+          }
+          sx={{ mb: 2, alignItems: 'center' }}
+        >
+          有 {data?.invalidatedPlans} 个发布计划因审批后配置变更而失效，未推进环境需重新评审；已推进环境仍按原快照运行。
+        </Alert>
+      )}
+
       <Box className="dashboard-grid">
         <Card>
           <CardHeader title="开关采用与回滚趋势" subheader="近七日配置变化" />
