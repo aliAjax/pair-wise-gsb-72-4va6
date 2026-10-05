@@ -25,9 +25,11 @@ import SaveOutlinedIcon from '@mui/icons-material/SaveOutlined'
 import SendOutlinedIcon from '@mui/icons-material/SendOutlined'
 import ArrowBackIcon from '@mui/icons-material/ArrowBack'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { useGetAuditQuery, useGetFlagQuery, useGetFlagsQuery, useSaveFlagMutation, useSubmitForReviewMutation } from '@/services/flagApi'
+import { useGetAuditQuery, useGetFlagQuery, useGetFlagsQuery, useGetSnapshotsQuery, useSaveFlagMutation, useSubmitForReviewMutation } from '@/services/flagApi'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
 import { DependencyGraph } from '@/components/DependencyGraph'
+import { PlanStatusChip, EnvironmentStateChip } from '@/components/PlanStatusChip'
+import { SnapshotDetails } from '@/components/SnapshotDetails'
 import type { AudienceRule, Dependency, FeatureFlag, RuleOperator, RolloutStep } from '@/types'
 
 const now = new Date().toISOString()
@@ -54,6 +56,8 @@ const emptyFlag = (): FeatureFlag => ({
   createdAt: now,
   updatedAt: now,
   lastChangedBy: '林默',
+  configRevision: 0,
+  plan: null,
 })
 
 const operators: Array<{ value: RuleOperator; label: string }> = [
@@ -77,9 +81,17 @@ export function FlagEditorPage() {
   const { data: existing, isLoading } = useGetFlagQuery(id ?? '', { skip: isNew })
   const { data: allFlags = [] } = useGetFlagsQuery({})
   const { data: audit = [] } = useGetAuditQuery({ flagId: id ?? '' }, { skip: isNew })
+  const { data: snapshots = [] } = useGetSnapshotsQuery(id ?? '', { skip: isNew })
   const [saveFlag, saveState] = useSaveFlagMutation()
   const [submitReview, submitState] = useSubmitForReviewMutation()
   const activeFlag = savedFlag ?? draft
+
+  const advancedEnvironments = (activeFlag.plan?.environments ?? []).filter(
+    (runtime) => runtime.state !== 'awaiting' && runtime.state !== 'rolled-back',
+  )
+  const latestSnapshot = activeFlag.plan
+    ? snapshots.find((snapshot) => snapshot.id === activeFlag.plan?.latestSnapshotId)
+    : undefined
 
   useEffect(() => {
     if (existing) setDraft(existing)
@@ -233,12 +245,25 @@ export function FlagEditorPage() {
         </Alert>
       )}
 
+      {activeFlag.plan && advancedEnvironments.length > 0 && (
+        <Alert
+          severity={activeFlag.plan.status === 'invalidated' ? 'error' : 'warning'}
+          sx={{ mb: 2 }}
+        >
+          {activeFlag.plan.status === 'invalidated'
+            ? '未推进环境的计划已因配置变更失效，保存后需重新提交评审；'
+            : '保存受快照保护的配置（受众、依赖、回滚阈值）会使未推进环境的计划失效并要求重新审批；'}
+          已推进环境（{advancedEnvironments.map((runtime) => runtime.environment).join('、')}）继续按各自绑定的不可变快照运行，不受编辑影响。
+        </Alert>
+      )}
+
       <Card>
         <Tabs value={tab} onChange={(_event, value: number) => setTab(value)} className="editor-tabs">
           <Tab label="基础信息" />
           <Tab label="受众规则" />
           <Tab label="依赖与兼容" />
           <Tab label="灰度与回滚" />
+          <Tab label="发布快照" />
           <Tab label="审计记录" />
         </Tabs>
 
@@ -521,6 +546,71 @@ export function FlagEditorPage() {
         )}
 
         {tab === 4 && (
+          <CardContent className="editor-panel">
+            {activeFlag.plan ? (
+              <>
+                <Box className="section-heading">
+                  <Box>
+                    <Typography variant="h3">发布计划与各环境运行快照</Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      每次批准生成新的不可变快照；已推进环境绑定各自快照，配置更新不影响其运行。
+                    </Typography>
+                  </Box>
+                  <PlanStatusChip status={activeFlag.plan.status} />
+                </Box>
+                <Box className="rule-editor" sx={{ mb: 3 }}>
+                  {activeFlag.plan.environments.map((runtime) => (
+                    <Box key={runtime.environment} className="rule-row" sx={{ gridTemplateColumns: '90px 110px 1fr auto' }}>
+                      <Typography fontWeight={800}>{runtime.environment.toUpperCase()}</Typography>
+                      <EnvironmentStateChip state={runtime.state} />
+                      <Box>
+                        <Typography variant="body2">
+                          {runtime.snapshotId
+                            ? `快照 v${snapshots.find((snapshot) => snapshot.id === runtime.snapshotId)?.version ?? '?'} · 放量 ${runtime.percentage}%${runtime.paused ? ' · 已冻结' : ''}`
+                            : '未推进，等待审批后绑定最新快照'}
+                        </Typography>
+                        {runtime.brokenChains.map((chain) => (
+                          <Typography key={chain.dependencyFlagId} variant="caption" color="error.main">
+                            断链：{chain.dependencyFlagKey} 已回滚，停止下一阶段
+                          </Typography>
+                        ))}
+                      </Box>
+                      <Button component={Link} to="/rollout" size="small">去推进</Button>
+                    </Box>
+                  ))}
+                </Box>
+                {latestSnapshot ? (
+                  <SnapshotDetails snapshot={latestSnapshot} flagLookup={(flagId) => allFlags.find((item) => item.id === flagId)?.name} />
+                ) : (
+                  <Alert severity="info">最新快照记录缺失，请重新审批生成。</Alert>
+                )}
+                {snapshots.length > 1 && (
+                  <>
+                    <Divider sx={{ my: 2 }} />
+                    <Typography variant="h3" sx={{ mb: 1 }}>历史快照</Typography>
+                    <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                      {snapshots.map((snapshot) => (
+                        <Chip
+                          key={snapshot.id}
+                          size="small"
+                          variant={snapshot.id === activeFlag.plan?.latestSnapshotId ? 'filled' : 'outlined'}
+                          color={snapshot.id === activeFlag.plan?.latestSnapshotId ? 'success' : 'default'}
+                          label={`v${snapshot.version} · ${snapshot.approvedBy} · ${snapshot.createdAt.slice(5, 10)}`}
+                        />
+                      ))}
+                    </Stack>
+                  </>
+                )}
+              </>
+            ) : (
+              <Alert severity="info">
+                该开关尚未审批。审批通过后将在此显示不可变发布快照（受众规则、依赖条件、回滚阈值及校验和）与各环境的绑定关系。
+              </Alert>
+            )}
+          </CardContent>
+        )}
+
+        {tab === 5 && (
           <CardContent className="editor-panel">
             <Typography variant="h3" sx={{ mb: 2 }}>配置审计记录</Typography>
             <Box className="audit-timeline">

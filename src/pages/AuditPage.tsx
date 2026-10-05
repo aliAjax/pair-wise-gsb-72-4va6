@@ -37,7 +37,16 @@ const actionLabel: Record<string, string> = {
   frozen: '冻结',
   unfrozen: '解冻',
   'rolled-back': '回滚',
-  'rollout-adjusted': '调整灰度',
+  'rollout-adjusted': '推进灰度',
+  'snapshot-created': '快照固化',
+  'plan-invalidated': '计划失效',
+  'chain-broken': '依赖断链',
+}
+
+const environmentLabel: Record<string, string> = {
+  dev: 'DEV',
+  staging: 'STG',
+  production: 'PROD',
 }
 
 export function AuditPage() {
@@ -55,6 +64,8 @@ export function AuditPage() {
     () => events.reduce((sum, event) => sum + event.affectedUsers, 0),
     [events],
   )
+  const chainBrokenCount = events.filter((event) => event.action === 'chain-broken').length
+  const snapshotCount = events.filter((event) => event.action === 'approved').length
 
   const submitRollback = async () => {
     if (!selectedFlag || reason.trim().length < 8) {
@@ -89,9 +100,9 @@ export function AuditPage() {
 
       <Box className="audit-summary">
         <Box><Typography variant="caption">审计事件</Typography><Typography className="summary-value">{events.length}</Typography></Box>
-        <Box><Typography variant="caption">回滚操作</Typography><Typography className="summary-value">{events.filter((event) => event.action === 'rolled-back').length}</Typography></Box>
+        <Box><Typography variant="caption">发布快照</Typography><Typography className="summary-value">{snapshotCount}</Typography></Box>
+        <Box><Typography variant="caption">依赖断链</Typography><Typography className={`summary-value${chainBrokenCount > 0 ? ' danger' : ''}`}>{chainBrokenCount}</Typography></Box>
         <Box><Typography variant="caption">累计影响用户</Typography><Typography className="summary-value">{totalImpact.toLocaleString()}</Typography></Box>
-        <Box><Typography variant="caption">平均响应时间</Typography><Typography className="summary-value">8.4 分钟</Typography></Box>
       </Box>
 
       <Card sx={{ mb: 2 }}>
@@ -139,7 +150,17 @@ export function AuditPage() {
                       <Typography component={Link} to={`/flags/${event.flagId}`} variant="body2" fontWeight={700}>{event.flagKey}</Typography>
                       {relatedFlag && <FlagStatusChip status={relatedFlag.status} />}
                     </TableCell>
-                    <TableCell sx={{ maxWidth: 420 }}>{event.summary}</TableCell>
+                    <TableCell sx={{ maxWidth: 420 }}>
+                      {event.summary}
+                      <Stack direction="row" spacing={0.5} sx={{ mt: 0.5 }} flexWrap="wrap" useFlexGap>
+                        {event.snapshotId && (
+                          <Chip size="small" variant="outlined" color="success" label="已固化快照" sx={{ fontFamily: 'monospace', fontSize: 10 }} />
+                        )}
+                        {event.environments?.map((environment) => (
+                          <Chip key={environment} size="small" variant="outlined" label={environmentLabel[environment] ?? environment} />
+                        ))}
+                      </Stack>
+                    </TableCell>
                     <TableCell>
                       <Chip size="small" variant="outlined" label={`${event.before || '-'} → ${event.after || '-'}`} />
                     </TableCell>

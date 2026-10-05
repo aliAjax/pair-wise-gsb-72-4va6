@@ -40,6 +40,13 @@ export function DependenciesPage() {
   )
   const activeConflicts = conflicts.filter((item) => item.source.enabled && item.target?.enabled)
 
+  /** 依赖断链：源计划的某环境依赖了已回滚开关 */
+  const brokenChains = flags.flatMap((flag) =>
+    (flag.plan?.environments ?? []).flatMap((runtime) =>
+      runtime.brokenChains.map((chain) => ({ flag, environment: runtime.environment, chain })),
+    ),
+  )
+
   return (
     <Box>
       <Box className="page-heading">
@@ -67,6 +74,16 @@ export function DependenciesPage() {
       ) : (
         <Alert severity="success" sx={{ mb: 2 }}>
           当前已启用开关之间没有直接互斥冲突。
+        </Alert>
+      )}
+
+      {brokenChains.length > 0 && (
+        <Alert
+          severity="error"
+          action={<Button component={Link} to="/rollout" color="inherit" size="small">前往处理</Button>}
+          sx={{ mb: 2 }}
+        >
+          {brokenChains.map((item) => `${item.flag.name}@${item.environment}`).join('、')} 的前置依赖已回滚，环境已断链并停止下一阶段，需重新审批。
         </Alert>
       )}
 

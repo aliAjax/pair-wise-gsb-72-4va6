@@ -86,7 +86,7 @@ export function ReviewPage() {
       }).unwrap()
       setDialogOpen(false)
       dispatch(clearReviewSelection())
-      setMessage(decision === 'approved' ? '已批准发布，状态和影响范围已写入审计日志' : '已驳回并恢复为草稿')
+      setMessage(decision === 'approved' ? '已批准并生成不可变发布快照，受众规则、依赖条件与回滚阈值已固化' : '已驳回并恢复为草稿')
     } catch {
       setMessage('审批提交失败，请重试')
     }
@@ -184,8 +184,17 @@ export function ReviewPage() {
                 <Box><Typography variant="caption">目标环境</Typography><Typography fontWeight={700}>{activeFlag.environment.toUpperCase()}</Typography></Box>
                 <Box><Typography variant="caption">灰度比例</Typography><Typography fontWeight={700}>{activeFlag.rolloutPercentage}%</Typography></Box>
                 <Box><Typography variant="caption">受众规则</Typography><Typography fontWeight={700}>{activeFlag.audienceRules.length} 条</Typography></Box>
-                <Box><Typography variant="caption">监控指标</Typography><Typography fontWeight={700}>{activeFlag.metricNames.length} 个</Typography></Box>
+                <Box><Typography variant="caption">配置版本</Typography><Typography fontWeight={700}>rev.{activeFlag.configRevision}</Typography></Box>
               </Box>
+
+              {activeFlag.plan?.status === 'invalidated' && (
+                <Alert severity="error" sx={{ mt: 2 }}
+                  action={<Button component="a" href={`/flags/${activeFlag.id}`} size="small" color="inherit">查看配置</Button>}
+                >
+                  该开关审批后配置已更新（rev. 变更），未推进环境的计划已失效，本次批准将生成新快照；已推进环境继续按旧快照运行。
+                  <Typography variant="caption" display="block">{activeFlag.plan.invalidatedReason}</Typography>
+                </Alert>
+              )}
 
               <Divider sx={{ my: 2 }} />
               <Typography variant="h3" sx={{ mb: 1 }}>发布条件检查</Typography>
@@ -264,7 +273,7 @@ export function ReviewPage() {
                 <MenuItem value="2026-10-03 09:00">冻结至 10 月 3 日 09:00</MenuItem>
               </TextField>
               <Alert severity="info" sx={{ mt: 2 }}>
-                批准后会记录审批人、意见、配置前后状态和预估受影响用户数。
+                批准后立即生成不可变发布快照，固化受众规则、依赖条件与回滚阈值（含校验和）；配置再变更只会使未推进环境失效重审，已推进环境始终按各自快照运行。
               </Alert>
             </>
           )}

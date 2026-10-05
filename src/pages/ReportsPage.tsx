@@ -20,10 +20,13 @@ import {
 } from '@mui/material'
 import DownloadOutlinedIcon from '@mui/icons-material/DownloadOutlined'
 import AssessmentOutlinedIcon from '@mui/icons-material/AssessmentOutlined'
-import { useGetAuditQuery, useGetDashboardQuery, useGetFlagsQuery, useGetIssuesQuery } from '@/services/flagApi'
+import { useGetAuditQuery, useGetDashboardQuery, useGetFlagsQuery, useGetIssuesQuery, useGetSnapshotsQuery } from '@/services/flagApi'
+import { EnvironmentStateChip, PlanStatusChip } from '@/components/PlanStatusChip'
 import { FlagStatusChip } from '@/components/FlagStatusChip'
 
 const escapeCsv = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`
+
+const envLabel: Record<string, string> = { dev: 'DEV', staging: 'STG', production: 'PROD' }
 
 export function ReportsPage() {
   const [environment, setEnvironment] = useState('')
@@ -32,38 +35,58 @@ export function ReportsPage() {
   const { data: dashboard } = useGetDashboardQuery()
   const { data: issues = [] } = useGetIssuesQuery({})
   const { data: audit = [] } = useGetAuditQuery({})
+  const { data: snapshots = [] } = useGetSnapshotsQuery(undefined)
 
   const reportFlags = useMemo(
     () => flags.filter((flag) => !environment || flag.environment === environment),
     [environment, flags],
   )
 
+  const brokenChainFlags = reportFlags.filter((flag) =>
+    flag.plan?.environments.some((runtime) => runtime.brokenChains.length > 0),
+  )
+
   const exportReport = () => {
     const rows = [
-      ['开关Key', '名称', '环境', '状态', '灰度比例', '负责人', '团队', '受众规则', '依赖数', '监控指标', '回滚条件', '预计影响用户'],
-      ...reportFlags.map((flag) => [
-        flag.key,
-        flag.name,
-        flag.environment,
-        flag.status,
-        `${flag.rolloutPercentage}%`,
-        flag.owner,
-        flag.team,
-        flag.audienceRules.length,
-        flag.dependencies.length,
-        flag.metricNames.join('|'),
-        flag.rollbackConditions.join('|'),
-        Math.round(980000 * (flag.rolloutPercentage / 100)),
-      ]),
+      ['开关Key', '名称', '环境', '状态', '计划状态', '生产放量', '运行快照版本', '受众规则', '依赖条件', '回滚阈值', '断链环境', '配置版本', '预计影响用户'],
+      ...reportFlags.map((flag) => {
+        const prod = flag.plan?.environments.find((item) => item.environment === 'production')
+        const versions = [
+          ...new Set(
+            (flag.plan?.environments ?? [])
+              .map((runtime) => snapshots.find((snapshot) => snapshot.id === runtime.snapshotId)?.version)
+              .filter((version): version is number => typeof version === 'number'),
+          ),
+        ]
+        const brokenEnvs = (flag.plan?.environments ?? [])
+          .filter((runtime) => runtime.brokenChains.length > 0)
+          .map((runtime) => envLabel[runtime.environment] ?? runtime.environment)
+        const latest = flag.plan ? snapshots.find((snapshot) => snapshot.id === flag.plan?.latestSnapshotId) : undefined
+        return [
+          flag.key,
+          flag.name,
+          flag.environment,
+          flag.status,
+          flag.plan?.status ?? 'unapproved',
+          `${prod?.percentage ?? 0}%`,
+          versions.length > 0 ? versions.join('|') : latest ? `v${latest.version}(待推进)` : '-',
+          latest?.payload.audienceRules.length ?? 0,
+          latest?.payload.dependencies.length ?? flag.dependencies.length,
+          (latest?.payload.rollbackThresholds ?? flag.rollbackConditions).join('|'),
+          brokenEnvs.join('|'),
+          flag.configRevision,
+          Math.round(980000 * ((prod?.percentage ?? 0) / 100)),
+        ]
+      }),
     ]
-    const csv = `\uFEFF${rows.map((row) => row.map(escapeCsv).join(',')).join('\n')}`
+    const csv = `﻿${rows.map((row) => row.map(escapeCsv).join(',')).join('\n')}`
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
     const anchor = document.createElement('a')
     anchor.href = url
     anchor.download = `feature-flag-release-report-${new Date().toISOString().slice(0, 10)}.csv`
     anchor.click()
     URL.revokeObjectURL(url)
-    setMessage('发布报告已导出')
+    setMessage('发布报告已按各环境运行快照导出')
   }
 
   const riskFlags = reportFlags.filter((flag) => {
@@ -77,7 +100,7 @@ export function ReportsPage() {
         <Box>
           <Typography variant="h2">发布报告</Typography>
           <Typography color="text.secondary">
-            汇总开关配置、影响评审问题、灰度状态与审计轨迹，导出可归档的发布报告。
+            报告口径以审批快照为准：已推进环境按各自绑定快照统计，回滚与断链按环境标注，避免“报告与生产实际运行版本对不上”。
           </Typography>
         </Box>
         <Stack direction="row" spacing={1}>
@@ -104,16 +127,29 @@ export function ReportsPage() {
             <Typography className="summary-value">{reportFlags.length} 个开关</Typography>
           </Box>
         </Box>
-        <Box><Typography variant="caption">生产已启用</Typography><Typography className="summary-value">{reportFlags.filter((flag) => flag.enabled).length}</Typography></Box>
-        <Box><Typography variant="caption">未解决阻断项</Typography><Typography className="summary-value danger">{riskFlags.length}</Typography></Box>
+        <Box><Typography variant="caption">发布快照</Typography><Typography className="summary-value">{snapshots.length}</Typography></Box>
+        <Box><Typography variant="caption">断链计划</Typography><Typography className={`summary-value${brokenChainFlags.length > 0 ? ' danger' : ''}`}>{brokenChainFlags.length}</Typography></Box>
         <Box><Typography variant="caption">审计事件</Typography><Typography className="summary-value">{audit.length}</Typography></Box>
+        <Box><Typography variant="caption">未解决阻断项</Typography><Typography className={`summary-value${riskFlags.length > 0 ? ' danger' : ''}`}>{riskFlags.length}</Typography></Box>
         <Box><Typography variant="caption">影响用户</Typography><Typography className="summary-value">{(dashboard?.affectedUsers ?? 0).toLocaleString()}</Typography></Box>
       </Box>
+
+      {brokenChainFlags.length > 0 && (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {brokenChainFlags.map((flag) =>
+            (flag.plan?.environments ?? [])
+              .filter((runtime) => runtime.brokenChains.length > 0)
+              .map((runtime) => `${flag.name}@${envLabel[runtime.environment]}`)
+              .join('、'),
+          ).join('；')}
+          {' '}存在依赖断链，已停止下一阶段。
+        </Alert>
+      )}
 
       <Box className="report-grid">
         <Card>
           <CardContent>
-            <Typography variant="h3" sx={{ mb: 2 }}>环境采用率</Typography>
+            <Typography variant="h3" sx={{ mb: 2 }}>环境采用率（按运行快照）</Typography>
             {dashboard?.environmentDiff.map((item) => (
               <Box key={item.flag} className="report-bar-row">
                 <Box className="report-bar-copy">
@@ -146,39 +182,69 @@ export function ReportsPage() {
 
       <Card>
         <CardContent>
-          <Typography variant="h3" sx={{ mb: 1.5 }}>发布明细</Typography>
+          <Typography variant="h3" sx={{ mb: 1.5 }}>发布快照与环境运行明细</Typography>
           <TableContainer>
             <Table>
               <TableHead>
                 <TableRow>
                   <TableCell>功能开关</TableCell>
-                  <TableCell>环境 / 状态</TableCell>
-                  <TableCell>灰度</TableCell>
-                  <TableCell>影响规则</TableCell>
-                  <TableCell>监控与回滚</TableCell>
+                  <TableCell>计划 / 开关状态</TableCell>
+                  <TableCell>各环境运行（快照 v / 放量）</TableCell>
+                  <TableCell>快照内容</TableCell>
                   <TableCell>最后变更</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
-                {reportFlags.map((flag) => (
-                  <TableRow key={flag.id} hover>
-                    <TableCell>
-                      <Typography variant="body2" fontWeight={700}>{flag.name}</Typography>
-                      <Typography variant="caption" color="text.secondary">{flag.key}</Typography>
-                    </TableCell>
-                    <TableCell>
-                      <Chip size="small" variant="outlined" label={flag.environment.toUpperCase()} />
-                      <Box sx={{ mt: 0.5 }}><FlagStatusChip status={flag.status} /></Box>
-                    </TableCell>
-                    <TableCell>{flag.rolloutPercentage}%</TableCell>
-                    <TableCell>{flag.audienceRules.length} 条规则 · {flag.regions.length} 地区</TableCell>
-                    <TableCell>{flag.metricNames.length} 指标 · {flag.rollbackConditions.length} 回滚条件</TableCell>
-                    <TableCell>
-                      <Typography variant="body2">{flag.lastChangedBy}</Typography>
-                      <Typography variant="caption" color="text.secondary">{flag.updatedAt.slice(0, 16).replace('T', ' ')}</Typography>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {reportFlags.map((flag) => {
+                  const latest = flag.plan
+                    ? snapshots.find((snapshot) => snapshot.id === flag.plan?.latestSnapshotId)
+                    : undefined
+                  const versionOf = (snapshotId: string) => snapshots.find((snapshot) => snapshot.id === snapshotId)?.version
+                  return (
+                    <TableRow key={flag.id} hover selected={flag.plan?.status === 'invalidated'}>
+                      <TableCell>
+                        <Typography variant="body2" fontWeight={700}>{flag.name}</Typography>
+                        <Typography variant="caption" color="text.secondary">{flag.key} · rev.{flag.configRevision}</Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Stack spacing={0.5} alignItems="flex-start">
+                          {flag.plan ? <PlanStatusChip status={flag.plan.status} /> : <Chip size="small" variant="outlined" label="未审批" />}
+                          <FlagStatusChip status={flag.status} />
+                        </Stack>
+                      </TableCell>
+                      <TableCell>
+                        <Stack spacing={0.5} alignItems="flex-start">
+                          {(flag.plan?.environments ?? []).map((runtime) => (
+                            <Stack key={runtime.environment} direction="row" spacing={0.7} alignItems="center">
+                              <Typography variant="caption" sx={{ width: 34 }}>{envLabel[runtime.environment]}</Typography>
+                              <EnvironmentStateChip state={runtime.state} />
+                              <Typography variant="caption">
+                                {runtime.snapshotId ? `v${versionOf(runtime.snapshotId) ?? '?'} · ${runtime.percentage}%` : '未绑定快照'}
+                              </Typography>
+                              {runtime.brokenChains.length > 0 && <Chip size="small" color="error" label="断链" />}
+                            </Stack>
+                          ))}
+                          {!flag.plan && <Typography variant="caption" color="text.secondary">审批后生成快照</Typography>}
+                        </Stack>
+                      </TableCell>
+                      <TableCell>
+                        {latest ? (
+                          <Typography variant="caption">
+                            规则 {latest.payload.audienceRules.length} · 依赖 {latest.payload.dependencies.length} · 阈值 {latest.payload.rollbackThresholds.length}
+                          </Typography>
+                        ) : (
+                          <Typography variant="caption" color="text.secondary">
+                            规则 {flag.audienceRules.length} · 依赖 {flag.dependencies.length} · 回滚条件 {flag.rollbackConditions.length}（待固化）
+                          </Typography>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2">{flag.lastChangedBy}</Typography>
+                        <Typography variant="caption" color="text.secondary">{flag.updatedAt.slice(0, 16).replace('T', ' ')}</Typography>
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
               </TableBody>
             </Table>
           </TableContainer>

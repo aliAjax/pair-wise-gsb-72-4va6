@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "verify:snapshots": "esbuild scripts/verify-snapshots.ts --bundle --platform=node --format=esm --alias:@=./src --outfile=scripts/.verify-bundle.mjs && node scripts/.verify-bundle.mjs"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",

@@ -75,6 +75,20 @@ export function DashboardPage() {
 
       {isLoading && <LinearProgress sx={{ mb: 2 }} />}
 
+      {(data?.brokenChains ?? 0) > 0 && (
+        <Alert
+          severity="error"
+          action={
+            <Button component={Link} to="/rollout" color="inherit" size="small" endIcon={<ArrowForwardIcon />}>
+              查看发布时间线
+            </Button>
+          }
+          sx={{ mb: 2, alignItems: 'center' }}
+        >
+          检测到 {data?.brokenChains} 处依赖断链：依赖开关回滚后，相关发布计划已按环境停止下一阶段，需重新审批解除。
+        </Alert>
+      )}
+
       {blockerIssues.length > 0 && (
         <Alert
           severity="error"
